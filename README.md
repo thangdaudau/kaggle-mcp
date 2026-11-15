@@ -30,8 +30,33 @@ Environment variables available to the job:
 |---|---|
 | `KJOB_DATA_DIR` | mount of `data_dir` (read-only); subdirectories keep their structure |
 | `KJOB_CODE_DIR` | unpacked project code |
+| `KJOB_DEADLINE` | epoch seconds when the run is stopped (`time_limit_h`, default 11.5 h) |
+| `KJOB_RESUME_DIR` | output of the `resume_from` job (read-only), if given |
 
-Long runs should write checkpoints into the working directory so partial results survive a failure.
+### Runs longer than 12 hours
+
+Kaggle stops every run after 12 hours. A job is stopped at `KJOB_DEADLINE` instead, before that
+cutoff, so everything it wrote to the working directory is saved; `job_output` then reports
+`incomplete: true` and keeps the kernel on Kaggle. Submit the same job again with
+`resume_from=<job_id>` to continue: the previous output is mounted at `KJOB_RESUME_DIR`, without a
+round trip through the local machine. Once a resumed part is downloaded, the part it continued from
+is deleted from Kaggle.
+
+```python
+import json, os
+from pathlib import Path
+
+resume = os.environ.get("KJOB_RESUME_DIR")
+state = json.loads((Path(resume) / "ckpt.json").read_text()) if resume else {"step": 0}
+while state["step"] < TOTAL_STEPS:
+    train_one_step(state)
+    state["step"] += 1
+    Path("ckpt.json").write_text(json.dumps(state))  # cwd is the job's output
+```
+
+A script that stops early on its own (for example by checking `KJOB_DEADLINE`) should create the
+file `kjob_incomplete` in its cwd so `job_output` reports it as incomplete. For a chain of parts,
+upload the input data once with `upload_dataset` and pass `datasets=[...]` rather than `data_dir`.
 
 ## Tools
 
@@ -49,7 +74,7 @@ Long runs should write checkpoints into the working directory so partial results
 ```bash
 kjob wait <job_id>   # polls every 60 s, prints status changes, exit 0 = complete, 1 = failed
 kjob list
-kjob pending         # jobs not downloaded yet, from the local store only (used by a SessionStart hook)
+kjob pending         # jobs not downloaded yet or stopped and not resumed; local store only (SessionStart hook)
 ```
 
 Job records live in `~/.local/share/kaggle-mcp/jobs.json`, so jobs remain visible after a restart.

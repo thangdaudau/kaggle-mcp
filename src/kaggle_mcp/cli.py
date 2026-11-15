@@ -26,18 +26,30 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list", help="list jobs with current status")
     sub.add_parser(
         "pending",
-        help="list jobs whose output was not downloaded yet (local store only, no network)",
+        help="list jobs not downloaded yet or stopped and not resumed (local store only)",
     )
     args = parser.parse_args(argv)
 
     if args.cmd == "pending":
-        pending = [j for j in Store().jobs() if not j.cleaned and j.output_dir is None]
+        all_jobs = Store().jobs()
+        pending = [j for j in all_jobs if not j.cleaned and j.output_dir is None]
+        resumed = {j.resume_from for j in all_jobs}
+        stalled = [
+            j for j in all_jobs if j.incomplete and not j.cleaned and j.kernel_ref not in resumed
+        ]
         if pending:
             print(
                 "Unfinished Kaggle jobs (kaggle-jobs MCP). For each: run `kjob wait <id>` "
                 "in the background, then call job_output when it exits."
             )
             for job in pending:
+                print(_line(job))
+        if stalled:
+            print(
+                "Kaggle jobs stopped at their time limit and not resumed yet. For each: "
+                "submit_job(..., resume_from=<id>) to continue, or cleanup_job(<id>) to drop it."
+            )
+            for job in stalled:
                 print(_line(job))
         return 0
 

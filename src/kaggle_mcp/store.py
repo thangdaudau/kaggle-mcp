@@ -29,6 +29,8 @@ class Job:
     ephemeral: bool = True
     output_dir: str | None = None
     cleaned: bool = False
+    resume_from: str | None = None  # kernel_ref of the job whose output this job continues from
+    incomplete: bool = False  # the run stopped at its time limit; resume it with a new job
 
     @property
     def terminal(self) -> bool:

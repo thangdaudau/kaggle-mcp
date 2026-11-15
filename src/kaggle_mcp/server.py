@@ -8,7 +8,7 @@ from typing import Any
 
 from mcp.server import MCPServer
 
-from kaggle_mcp.jobs import Jobs
+from kaggle_mcp.jobs import DEFAULT_TIME_LIMIT_H, Jobs
 from kaggle_mcp.kaggle_client import RealKaggleClient
 from kaggle_mcp.store import Job, Store
 
@@ -18,6 +18,8 @@ Jobs run on Kaggle, independent of this session: submit_job returns immediately.
 To be notified when a job finishes, run the shell command `kjob wait <job_id>` in the
 background (it polls every 60s and exits when the job is done), then call job_output.
 Job state is kept locally, so after a session restart list_jobs shows earlier jobs.
+Runs are capped at 12 h: for longer work the script checkpoints into its cwd, and when
+job_output reports incomplete, submit the same job again with resume_from=<previous job_id>.
 """
 
 server = MCPServer("kaggle-jobs", instructions=INSTRUCTIONS)
@@ -43,6 +45,8 @@ def submit_job(
     gpu: bool = False,
     internet: bool = True,
     ephemeral: bool = True,
+    resume_from: str | None = None,
+    time_limit_h: float = DEFAULT_TIME_LIMIT_H,
 ) -> dict[str, Any]:
     """Run a Python project on Kaggle as a private background job; returns immediately.
 
@@ -62,6 +66,11 @@ def submit_job(
         internet: Allow network access (pip installs, downloads).
         ephemeral: Delete the job's kernel, outputs and per-job dataset from Kaggle after
             job_output downloads them, so Kaggle storage does not fill up.
+        resume_from: job_id of a finished job whose output (e.g. checkpoints) this job continues
+            from; on Kaggle its path is in env var KJOB_RESUME_DIR (read-only).
+        time_limit_h: Stop the run after this many hours (max 12, Kaggle's cutoff) so its
+            output is saved. Env var KJOB_DEADLINE holds the deadline as epoch seconds; the run
+            is stopped there if the script has not exited, and job_output reports incomplete.
     """
     job = _jobs().submit(
         project_dir,
@@ -71,6 +80,8 @@ def submit_job(
         gpu=gpu,
         internet=internet,
         ephemeral=ephemeral,
+        resume_from=resume_from,
+        time_limit_h=time_limit_h,
     )
     return _job_view(job) | {"hint": f"run `kjob wait {job.id}` in the background to be notified"}
 
@@ -100,10 +111,17 @@ def job_logs(job_id: str, tail_chars: int = 8000) -> str:
 def job_output(job_id: str, dest_dir: str | None = None) -> dict[str, Any]:
     """Download a finished job's output files (default: <project_dir>/kaggle_out/<job_id>/).
 
-    For ephemeral jobs the kernel and its per-job dataset are then deleted from Kaggle.
+    For ephemeral jobs the kernel and its per-job dataset are then deleted from Kaggle, unless
+    the run stopped at its time limit (incomplete): then it is kept so a new job can resume it.
     """
     job, files = _jobs().output(job_id, dest_dir)
-    return {"job": _job_view(job), "files": files}
+    result: dict[str, Any] = {"job": _job_view(job), "files": files}
+    if job.incomplete:
+        result["hint"] = (
+            f"run stopped at its time limit; continue with submit_job(..., resume_from="
+            f"'{job.id}'), or cleanup_job('{job.id}') to drop it"
+        )
+    return result
 
 
 @server.tool()

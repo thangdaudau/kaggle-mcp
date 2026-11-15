@@ -16,6 +16,8 @@ from kaggle_mcp.store import Dataset, Job, Store
 
 DATASET_READY_TIMEOUT_S = 30 * 60
 LOG_TAIL_CHARS = 8000
+KAGGLE_MAX_RUN_H = 12
+DEFAULT_TIME_LIMIT_H = 11.5  # stop before Kaggle's 12 h cutoff so the output is saved
 
 
 class Jobs:
@@ -95,10 +97,19 @@ class Jobs:
         gpu: bool = False,
         internet: bool = True,
         ephemeral: bool = True,
+        resume_from: str | None = None,
+        time_limit_h: float = DEFAULT_TIME_LIMIT_H,
     ) -> Job:
         project = Path(project_dir).expanduser().resolve()
         if not (project / entry).is_file():
             raise ValueError(f"entry script not found: {project / entry}")
+        if not 0 < time_limit_h <= KAGGLE_MAX_RUN_H:
+            raise ValueError(f"time_limit_h must be in (0, {KAGGLE_MAX_RUN_H}], got {time_limit_h}")
+        source = self.refresh(resume_from) if resume_from else None
+        if source and not source.terminal:
+            raise ValueError(f"cannot resume from {source.id}: it is still {source.status}")
+        if source and source.cleaned:
+            raise ValueError(f"cannot resume from {source.id}: its output was cleaned up")
         data_path = Path(data_dir).expanduser().resolve() if data_dir else None
         if data_path and not data_path.is_dir():
             raise ValueError(f"data_dir is not a directory: {data_path}")
@@ -116,10 +127,17 @@ class Jobs:
             bundle.write_kernel_folder(
                 Path(tmp),
                 kernel_ref=kernel_ref,
-                script=bundle.render_bootstrap(code_zip, entry, data_slug),
+                script=bundle.render_bootstrap(
+                    code_zip,
+                    entry,
+                    data_slug,
+                    resume_slug=source.id if source else None,
+                    time_limit_s=int(time_limit_h * 3600),
+                ),
                 gpu=gpu,
                 internet=internet,
                 dataset_sources=sources,
+                kernel_sources=[source.kernel_ref] if source else [],
             )
             result = self.client.push_kernel(tmp)
         if result.error:
@@ -137,9 +155,15 @@ class Jobs:
             datasets=sources,
             own_dataset=own_dataset,
             ephemeral=ephemeral,
+            resume_from=source.kernel_ref if source else None,
         )
         self.store.put_job(job)
         return job
+
+    def _resumers(self, job: Job) -> list[str]:
+        """Unfinished jobs that read this job's output."""
+        jobs = self.store.jobs()
+        return [j.id for j in jobs if j.resume_from == job.kernel_ref and not j.terminal]
 
     def refresh(self, job_id: str) -> Job:
         job = self.store.get_job(job_id)
@@ -184,10 +208,15 @@ class Jobs:
         dest.mkdir(parents=True, exist_ok=True)
         files = self.client.download_output(job.kernel_ref, str(dest))
         job.output_dir = str(dest.resolve())
+        job.incomplete = (dest / bundle.INCOMPLETE_MARKER).exists()
         self.store.put_job(job)
-        if job.ephemeral:
+        if job.ephemeral and not job.incomplete:  # keep an incomplete run for the next part
             self.cleanup(job.id)
             job = self.store.get_job(job.id)
+        if job.resume_from:  # this part has run, so the part it continued from is not needed
+            source = self.store.get_job(job.resume_from)
+            if source.ephemeral and not source.cleaned and not self._resumers(source):
+                self.cleanup(source.id)
         return job, [os.path.relpath(f, dest) for f in files]
 
     def cleanup(self, job_id: str) -> Job:
@@ -197,6 +226,9 @@ class Jobs:
             raise ValueError(f"job {job.id} is still {job.status}; refusing to delete it")
         if job.cleaned:
             return job
+        resumers = self._resumers(job)
+        if resumers:
+            raise ValueError(f"job {job.id} is being resumed by unfinished jobs: {resumers}")
         self.client.delete_kernel(job.kernel_ref)
         if job.own_dataset:
             self.client.delete_dataset(job.own_dataset)
