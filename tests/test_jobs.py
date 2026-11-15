@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import zipfile
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -238,6 +239,28 @@ def test_pending_lists_only_jobs_needing_attention(
     assert "kjob wait" in out
     listed = [line.split()[0] for line in out.splitlines()[1:]]
     assert sorted(listed) == ["finished", "running"]
+
+
+def _hammer_store(home: str, i: int) -> str:
+    """Repeatedly write one job into a shared store; return the error, if any."""
+    store = Store(Path(home))
+    job = _stored_job(f"job{i}")
+    try:
+        for n in range(100):
+            job.status = f"running-{n}"
+            store.put_job(job)
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    return ""
+
+
+def test_concurrent_writers_keep_every_job(tmp_path: Path) -> None:
+    # several `kjob wait` processes and the MCP server write the same store
+    with ProcessPoolExecutor(4) as pool:
+        errors = list(pool.map(_hammer_store, [str(tmp_path)] * 4, range(4)))
+    assert errors == [""] * 4
+    jobs = {j.id: j.status for j in Store(tmp_path).jobs()}
+    assert jobs == {f"job{i}": "running-99" for i in range(4)}
 
 
 def test_pending_prints_nothing_when_no_jobs(

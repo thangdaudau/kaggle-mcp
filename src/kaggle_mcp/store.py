@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -57,10 +60,19 @@ class Store:
         return cast(dict[str, Any], json.loads(self.path.read_text(encoding="utf-8")))
 
     def _save(self, data: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         tmp.replace(self.path)
+
+    @contextmanager
+    def _update(self) -> Generator[dict[str, Any]]:
+        """Read-modify-write under an exclusive lock: MCP server and `kjob` processes share it."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.with_suffix(".lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            data = self._load()
+            yield data
+            self._save(data)
 
     def jobs(self) -> list[Job]:
         return [Job(**j) for j in self._load()["jobs"]]
@@ -75,18 +87,15 @@ class Store:
         raise KeyError(f"unknown job: {job_id}")
 
     def put_job(self, job: Job) -> None:
-        data = self._load()
-        jobs = [j for j in data["jobs"] if j["id"] != job.id]
-        jobs.append(asdict(job))
-        data["jobs"] = jobs
-        self._save(data)
+        with self._update() as data:
+            jobs = [j for j in data["jobs"] if j["id"] != job.id]
+            jobs.append(asdict(job))
+            data["jobs"] = jobs
 
     def put_dataset(self, ds: Dataset) -> None:
-        data = self._load()
-        data["datasets"] = [d for d in data["datasets"] if d["ref"] != ds.ref] + [asdict(ds)]
-        self._save(data)
+        with self._update() as data:
+            data["datasets"] = [d for d in data["datasets"] if d["ref"] != ds.ref] + [asdict(ds)]
 
     def remove_dataset(self, ref: str) -> None:
-        data = self._load()
-        data["datasets"] = [d for d in data["datasets"] if d["ref"] != ref]
-        self._save(data)
+        with self._update() as data:
+            data["datasets"] = [d for d in data["datasets"] if d["ref"] != ref]
